@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>QuickServe QR</title>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@500;700;800&family=Figtree:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdn.tailwindcss.com/3.4.17"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script>tailwind.config={darkMode:'class',theme:{extend:{fontFamily:{d:['Bricolage Grotesque','system-ui','sans-serif'],b:['Figtree','system-ui','sans-serif']}}}}</script>
+<style>
+:root{box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+html{scroll-padding-top:env(safe-area-inset-top,0px)}
+body{font-family:'Figtree',system-ui,sans-serif;background:#f6f5f1;color:#1c1917}
+html.dark body{background:#14161a;color:#e7e5e4}
+h1,h2,h3,.fd{font-family:'Bricolage Grotesque',system-ui,sans-serif}
+.card{background:#fff;border:1px solid #e7e5e4;border-radius:14px}
+html.dark .card{background:#1d2026;border-color:#2e323a}
+.inp{width:100%;border:1px solid #d6d3d1;border-radius:10px;padding:.6rem .75rem;background:transparent}
+html.dark .inp{border-color:#3b404a}
+.inp:focus,button:focus-visible{outline:2px solid #4f46e5;outline-offset:2px}
+.btn{border-radius:10px;padding:.55rem 1rem;font-weight:600;transition:transform .1s}
+.btn:active{transform:scale(.97)}
+.em{background:#059669;color:#fff}.am{background:#f59e0b;color:#1c1917}.in{background:#4f46e5;color:#fff}
+.ghost{border:1px solid #d6d3d1}html.dark .ghost{border-color:#3b404a}
+.chip{padding:.35rem .9rem;border-radius:99px;border:1px solid #d6d3d1;white-space:nowrap;font-weight:500}
+html.dark .chip{border-color:#3b404a}.chip.on{background:#4f46e5;color:#fff;border-color:#4f46e5}
+.b-PENDING{background:#fef3c7;color:#92400e}.b-PREPARING{background:#e0e7ff;color:#3730a3}
+.b-COMPLETED{background:#d1fae5;color:#065f46}.b-CANCELLED{background:#fee2e2;color:#991b1b}
+.bdg{border-radius:99px;padding:.2rem .7rem;font-size:.75rem;font-weight:700}
+.pulse{animation:p 1.2s ease 2}@keyframes p{50%{box-shadow:0 0 0 6px rgba(245,158,11,.4)}}
+@media(prefers-reduced-motion:reduce){.pulse{animation:none}}
+</style>
+</head>
+<body>
+<div id="app" class="max-w-3xl mx-auto min-h-screen"></div>
+<div id="toast" class="fixed left-1/2 -translate-x-1/2 bottom-6 bg-stone-900 text-white px-4 py-2 rounded-lg text-sm hidden z-50"></div>
+<script>
+/* ===== RUN THIS ONCE in Supabase > SQL Editor =====
+create table if not exists restaurants(
+ id text primary key, name text not null, phone text, whatsapp text,
+ currency text default 'PKR', created_at timestamptz default now());
+alter table restaurants add column if not exists owner_id uuid references auth.users(id) on delete cascade default auth.uid();
+create unique index if not exists one_restaurant_per_owner on restaurants(owner_id);
+create table if not exists menu_items(
+ id bigint generated always as identity primary key,
+ restaurant_id text not null,
+ title text not null, price numeric not null, category text,
+ description text default '', img text default '', is_available boolean default true);
+create table if not exists orders(
+ id bigint generated always as identity primary key,
+ restaurant_id text not null,
+ order_type text check (order_type in ('INDOOR','OUTDOOR')),
+ table_number text, customer_name text, customer_phone text,
+ delivery_address text, note text default '',
+ items jsonb not null default '[]', total_amount numeric not null,
+ status text not null default 'PENDING' check (status in ('PENDING','PREPARING','COMPLETED','CANCELLED')),
+ created_at timestamptz default now());
+alter table restaurants enable row level security;
+alter table menu_items enable row level security;
+alter table orders enable row level security;
+drop policy if exists "open restaurants" on restaurants;
+drop policy if exists "open menu" on menu_items;
+drop policy if exists "open orders" on orders;
+-- restaurants: anyone can read (customers need the name); only the owner can write
+create policy "public read restaurants" on restaurants for select to anon, authenticated using (true);
+create policy "owner insert restaurant" on restaurants for insert to authenticated with check (owner_id = auth.uid());
+create policy "owner update restaurant" on restaurants for update to authenticated using (owner_id = auth.uid()) with check (owner_id = auth.uid());
+create policy "owner delete restaurant" on restaurants for delete to authenticated using (owner_id = auth.uid());
+-- menu: public read, owner-only write
+create policy "public read menu" on menu_items for select to anon, authenticated using (true);
+create policy "owner write menu" on menu_items for all to authenticated
+ using (exists (select 1 from restaurants r where r.id = menu_items.restaurant_id and r.owner_id = auth.uid()))
+ with check (exists (select 1 from restaurants r where r.id = menu_items.restaurant_id and r.owner_id = auth.uid()));
+-- orders: customers may only INSERT; only the owner can read / update / delete
+create policy "customers place orders" on orders for insert to anon, authenticated
+ with check (status = 'PENDING' and exists (select 1 from restaurants r where r.id = orders.restaurant_id));
+create policy "owner read orders" on orders for select to authenticated
+ using (exists (select 1 from restaurants r where r.id = orders.restaurant_id and r.owner_id = auth.uid()));
+create policy "owner update orders" on orders for update to authenticated
+ using (exists (select 1 from restaurants r where r.id = orders.restaurant_id and r.owner_id = auth.uid()))
+ with check (exists (select 1 from restaurants r where r.id = orders.restaurant_id and r.owner_id = auth.uid()));
+create policy "owner delete orders" on orders for delete to authenticated
+ using (exists (select 1 from restaurants r where r.id = orders.restaurant_id and r.owner_id = auth.uid()));
+alter publication supabase_realtime add table orders;  -- skip if it says already member
+-- Optional: claim an older restaurant row for your account:
+-- update restaurants set owner_id = '<your user id from Auth > Users>' where id = 'aeterna';
+-- For quick testing you can turn off "Confirm email" under Auth > Providers > Email.
+================================================== */
+const SB_URL='https://jtlyjdnyglrruwiutdyr.supabase.co',SB_KEY='sb_publishable_320Pgu96tk6E4tS6JV9G3Q_iwmR7eoC';
+let R=null,VP=null,user=null,menuFor=null,ch=null,poll=null,sb=null,firstLoad=true,loading=true;
+try{sb=supabase.createClient(SB_URL,SB_KEY)}catch(e){console.error(e)}
+const CKEY='qs_cart';
+let db={items:[],orders:[],cats:[]},cart=[],S={view:'home',tab:'orders',ctype:null,table:'',cat:'All',q:'',cartOpen:false,otab:'INDOOR',dark:false,qrN:8,unseen:0};
+try{cart=JSON.parse(localStorage.getItem(CKEY))||[]}catch(e){}
+const saveCart=()=>{try{localStorage.setItem(CKEY,JSON.stringify(cart))}catch(e){}};
+const $=s=>document.querySelector(s),esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const pk=n=>'PKR '+Number(n).toLocaleString();
+const toast=m=>{const t=$('#toast');t.textContent=m;t.classList.remove('hidden');clearTimeout(toast.t);toast.t=setTimeout(()=>t.classList.add('hidden'),2200)};
+const base=()=>location.href.split(/[?#]/)[0]+'?rest_id='+R.id;
+function beep(){try{const a=new (window.AudioContext||window.webkitAudioContext)(),o=a.createOscillator(),g=a.createGain();o.connect(g);g.connect(a.destination);o.frequency.value=880;g.gain.value=.15;o.start();o.stop(a.currentTime+.25)}catch(e){}}
+const err=(m,e)=>{console.error(m,e);toast(m+': '+((e&&e.message)||e))};
+const curId=()=>{const r=S.view==='admin'?R:S.view==='menu'?(VP||R):null;return r?r.id:null};
+async function loadOwnerRestaurant(){
+ const {data,error}=await sb.from('restaurants').select('*').eq('owner_id',user.id).maybeSingle();
+ if(error)return err('Restaurant load failed',error);
+ R=data||null}
+async function loadMenu(cid=curId()){
+ if(!cid)return;
+ const {data,error}=await sb.from('menu_items').select('*').eq('restaurant_id',cid).order('id');
+ if(error)return err('Menu load failed',error);
+ if(cid!==curId())return;
+ db.items=data.map(r=>({...r,price:+r.price,description:r.description||'',img:r.img||''}));
+ db.cats=[...new Set([...db.cats,...db.items.map(i=>i.category)])];
+ if(!(S.view==='menu'&&S.q))render()}
+function authView(){const su=S.authMode==='signup';
+ return `<form onsubmit="doAuth(event)" class="card p-5 space-y-3 mt-4"><h2 class="text-2xl font-bold">${su?'Create owner account':'Owner login'}</h2>
+ <input class="inp" name="email" type="email" placeholder="Email" autocomplete="email" required>
+ <input class="inp" name="pw" type="password" minlength="6" placeholder="Password (min 6 characters)" autocomplete="${su?'new-password':'current-password'}" required>
+ <button class="btn em w-full">${su?'Sign up':'Log in'}</button>
+ <button type="button" class="underline text-sm" onclick="set({authMode:'${su?'login':'signup'}'})">${su?'Have an account? Log in':'New restaurant? Sign up'}</button></form>`}
+async function doAuth(e){e.preventDefault();const f=new FormData(e.target),btn=e.target.querySelector('button'),su=S.authMode==='signup';
+ btn.disabled=true;
+ const cred={email:f.get('email').trim(),password:f.get('pw')};
+ const {data,error}=su?await sb.auth.signUp(cred):await sb.auth.signInWithPassword(cred);
+ btn.disabled=false;
+ if(error)return err(su?'Sign up failed':'Login failed',error);
+ if(!data.session)return toast('Check your email to confirm your account, then log in');
+ await onAuth(data.user)}
+async function onAuth(u){
+ if((u&&u.id)===(user&&user.id))return;
+ user=u;stopSync();R=null;db={items:[],orders:[],cats:[]};menuFor=null;firstLoad=true;
+ if(u){await loadOwnerRestaurant();startSync()}else if(S.view==='admin')S.view='home';
+ render()}
+async function logout(){const {error}=await sb.auth.signOut();if(error)return err('Logout failed',error);await onAuth(null);S.view='home';S.tab='orders';render()}
+async function loadOrders(){
+ if(!sb||!user||!R)return;
+ const rid=R.id;
+ const {data,error}=await sb.from('orders').select('*').eq('restaurant_id',rid).order('created_at',{ascending:false}).limit(200);
+ if(error){if(firstLoad)err('Orders load failed',error);firstLoad=false;return}
+ if(!user||!R||R.id!==rid)return;
+ const next=data.map(o=>({...o,total_amount:+o.total_amount,items:o.items||[],created_at:new Date(o.created_at).getTime()}));
+ const known=new Set(db.orders.map(o=>o.id)),fresh=next.filter(o=>!known.has(o.id)).length;
+ const changed=JSON.stringify(next)!==JSON.stringify(db.orders);
+ db.orders=next;
+ if(!firstLoad&&fresh){beep();S.unseen+=fresh;toast('New order received')}
+ firstLoad=false;
+ if(changed&&S.view!=='menu'&&!(S.view==='admin'&&S.tab!=='orders'))render()}
+function startSync(){stopSync();if(!sb||!user||!R)return;firstLoad=true;
+ try{ch=sb.channel('orders-'+R.id).on('postgres_changes',{event:'*',schema:'public',table:'orders',filter:'restaurant_id=eq.'+R.id},()=>loadOrders()).subscribe()}catch(e){console.error(e)}
+ poll=setInterval(loadOrders,5000);loadOrders()}
+function stopSync(){if(ch){sb.removeChannel(ch);ch=null}clearInterval(poll);poll=null}
+const set=o=>{Object.assign(S,o);render()};
+
+
+function render(){
+ document.documentElement.classList.toggle('dark',S.dark);
+ const cid=curId();if(!loading&&cid&&cid!==menuFor){menuFor=cid;db.items=[];db.cats=[];loadMenu(cid)}
+ const nav=`<header class="flex items-center justify-between gap-2 p-4">
+  <button onclick="set({view:'home'})" class="fd font-extrabold text-xl text-emerald-600">QuickServe<span class="text-amber-500">QR</span></button>
+  <div class="flex gap-2 text-sm">
+   <button class="btn ghost" onclick="goAdmin()">Admin${S.unseen?` <span class="bdg am">${S.unseen}</span>`:''}</button>
+   <button class="btn ghost" onclick="set({view:'menu',ctype:S.ctype||'INDOOR',table:S.table||'4'})">Customer</button>
+   <button class="btn ghost" aria-label="Toggle theme" onclick="set({dark:!S.dark})">${S.dark?'Light':'Dark'}</button></div></header>`;
+ $('#app').innerHTML=nav+`<main class="px-4 pb-28">${loading?'<p class="p-8 text-center text-stone-500">Loading from Supabase…</p>':({home,admin,menu})[S.view]()}</main>`+(S.view==='menu'?cartBar():'');
+ if(S.view==='admin'&&S.tab==='qr')drawQR();
+}
+function goAdmin(){S.unseen=0;set({view:'admin'})}
+function home(){return `<section class="py-10"><h1 class="text-4xl font-extrabold leading-tight">Scan. Order.<br>Eat.</h1>
+<p class="mt-3 text-stone-500 max-w-md">Table QR menus and takeaway links for restaurants. Orders reach the kitchen the moment a customer taps send.</p>
+<div class="mt-6 flex flex-wrap gap-3"><button class="btn em" onclick="goAdmin()">Open restaurant dashboard</button>
+<button class="btn in" onclick="set({view:'menu',ctype:'INDOOR',table:'4'})">Try as a diner at Table 4</button>
+<button class="btn am" onclick="set({view:'menu',ctype:'OUTDOOR'})">Try as a takeaway customer</button></div>
+<p class="mt-6 text-sm text-stone-500">Tip: open this page in two tabs. Place an order in one and watch it land in the other tab's dashboard with a sound.</p></section>`}
+
+/* ---------- ADMIN ---------- */
+function admin(){
+ if(!user)return authView();
+ if(!R)return `<form onsubmit="createRestaurant(event)" class="card p-5 space-y-3 mt-4"><h2 class="text-2xl font-bold">Set up your restaurant</h2>
+ <input class="inp" name="name" placeholder="Restaurant name" required>
+ <input class="inp" name="phone" placeholder="Contact number" required inputmode="tel">
+ <input class="inp" name="wa" placeholder="WhatsApp number" required inputmode="tel">
+ <input class="inp opacity-60" value="Currency: PKR" disabled>
+ <button class="btn em w-full">Create restaurant</button><button type="button" class="underline text-sm" onclick="logout()">Log out</button></form>`;
+ const tabs=[['orders','Live orders'],['menu','Menu'],['qr','QR codes']];
+ return `<div class="flex items-center justify-between gap-2"><h2 class="text-2xl font-bold">${esc(R.name)}</h2><button class="btn ghost text-sm" onclick="logout()">Log out</button></div><p class="text-xs text-stone-500">${esc(user.email)}</p>
+ <div class="flex gap-2 mt-3 overflow-x-auto">${tabs.map(t=>`<button class="chip ${S.tab===t[0]?'on':''}" onclick="set({tab:'${t[0]}'})">${t[1]}</button>`).join('')}</div>
+ <div class="mt-4">${({orders:ordersTab,menu:menuTab,qr:qrTab})[S.tab]()}</div>`}
+async function createRestaurant(e){e.preventDefault();const f=new FormData(e.target);
+ const {data,error}=await sb.from('restaurants').insert({id:'r'+Math.random().toString(36).slice(2,8),name:f.get('name'),phone:f.get('phone'),whatsapp:f.get('wa'),owner_id:user.id}).select().single();
+ if(error)return err('Could not create restaurant',error);
+ R=data;startSync();render()}
+const NEXT={PENDING:'PREPARING',PREPARING:'COMPLETED'};
+function ordersTab(){
+ const list=db.orders.filter(o=>o.order_type===S.otab).sort((a,b)=>b.created_at-a.created_at);
+ const cnt=t=>db.orders.filter(o=>o.order_type===t&&o.status==='PENDING').length;
+ return `<div class="flex gap-2 mb-3">${['INDOOR','OUTDOOR'].map(t=>`<button class="chip ${S.otab===t?'on':''}" onclick="set({otab:'${t}'})">${t==='INDOOR'?'Indoor':'Outdoor'} orders (${cnt(t)} new)</button>`).join('')}</div>
+ ${list.length?list.map(oCard).join(''):'<p class="card p-6 text-center text-stone-500">No orders yet. Open the customer view and place one.</p>'}`}
+function oCard(o){const d=new Date(o.created_at);
+ return `<article class="card p-4 mb-3 ${o.status==='PENDING'?'pulse':''}">
+ <div class="flex justify-between items-start"><div><h3 class="font-bold text-lg">#ORD-${o.id}</h3><p class="text-xs text-stone-500">${d.toLocaleDateString()} ${d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}</p></div>
+ <span class="bdg b-${o.status}">${o.status}</span></div>
+ <p class="mt-2 text-sm">${o.order_type==='INDOOR'?`<b>Table ${esc(o.table_number)}</b> · ${esc(o.customer_name)} · ${esc(o.customer_phone)}`:`<b>${esc(o.customer_name)}</b> · ${esc(o.customer_phone)}<br>${esc(o.delivery_address)}`}</p>
+ <ul class="mt-2 text-sm divide-y divide-stone-200 dark:divide-stone-700">${o.items.map(i=>`<li class="py-1 flex justify-between"><span>${i.quantity} × ${esc(i.title)}${i.note?`<em class="block text-xs text-stone-500">${esc(i.note)}</em>`:''}</span><span>${pk(i.quantity*i.price)}</span></li>`).join('')}</ul>
+ ${o.note?`<p class="text-xs mt-1 text-stone-500">Note: ${esc(o.note)}</p>`:''}
+ <div class="flex justify-between items-center mt-3"><b>${pk(o.total_amount)}</b><div class="flex gap-2">
+ ${NEXT[o.status]?`<button class="btn ${o.status==='PENDING'?'in':'em'}" onclick="setStatus(${o.id},'${NEXT[o.status]}')">Mark ${NEXT[o.status].toLowerCase()}</button><button class="btn ghost" onclick="setStatus(${o.id},'CANCELLED')">Cancel</button>`:''}</div></div></article>`}
+async function setStatus(id,s){const o=db.orders.find(x=>x.id===id),old=o.status;o.status=s;render();
+ const {error}=await sb.from('orders').update({status:s}).eq('id',id);
+ if(error){o.status=old;render();err('Status update failed',error)}}
+
+function menuTab(){
+ return `
+ <form onsubmit="addCat(event)" class="flex gap-2 mb-3"><input class="inp" name="c" placeholder="New category, e.g. Desserts" required><button class="btn in">Add</button></form>
+ <div class="flex gap-2 flex-wrap mb-4">${db.cats.map(c=>`<span class="chip">${esc(c)} <button aria-label="Delete ${esc(c)}" onclick="delCat('${esc(c)}')" class="ml-1 text-red-500">×</button></span>`).join('')}</div>
+ <form onsubmit="addItem(event)" class="card p-4 grid grid-cols-2 gap-2 mb-4"><h3 class="col-span-2 font-bold">Add item</h3>
+ <input class="inp col-span-2" name="title" placeholder="Item name" required>
+ <input class="inp" name="price" type="number" min="0" placeholder="Price (PKR)" required>
+ <select class="inp" name="category">${db.cats.map(c=>`<option class="text-black">${esc(c)}</option>`).join('')}</select>
+ <input class="inp col-span-2" name="description" placeholder="Description">
+ <input class="inp col-span-2" name="img" placeholder="Image URL (optional)">
+ <button class="btn em col-span-2">Save item</button></form>
+ ${db.items.map(i=>`<div class="card p-3 mb-2 flex items-center gap-3"><div class="flex-1 min-w-0"><b>${esc(i.title)}</b> <span class="text-xs text-stone-500">${esc(i.category)}</span><p class="text-sm">${pk(i.price)}</p></div>
+ <button class="btn ghost text-sm" onclick="toggleItem(${i.id})">${i.is_available?'In stock':'Sold out'}</button>
+ <button class="btn ghost text-sm" onclick="editItem(${i.id})">Edit</button>
+ <button class="text-red-500 px-1" aria-label="Delete" onclick="delItem(${i.id})">✕</button></div>`).join('')}`}
+const addCat=e=>{e.preventDefault();const c=new FormData(e.target).get('c').trim();if(c&&!db.cats.includes(c)){db.cats.push(c);render()}};
+async function delCat(c){
+ const {error}=await sb.from('menu_items').delete().eq('restaurant_id',R.id).eq('category',c);
+ if(error)return err('Delete failed',error);
+ db.cats=db.cats.filter(x=>x!==c);loadMenu()}
+async function addItem(e){e.preventDefault();const f=Object.fromEntries(new FormData(e.target));
+ const {error}=await sb.from('menu_items').insert({restaurant_id:R.id,title:f.title,price:+f.price,category:f.category,description:f.description||'',img:f.img||'',is_available:true});
+ if(error)return err('Save failed',error);loadMenu();toast('Item saved')}
+async function toggleItem(id){const i=db.items.find(x=>x.id===id);
+ const {error}=await sb.from('menu_items').update({is_available:!i.is_available}).eq('id',id);
+ if(error)return err('Update failed',error);loadMenu()}
+async function delItem(id){
+ const {error}=await sb.from('menu_items').delete().eq('id',id);
+ if(error)return err('Delete failed',error);loadMenu()}
+async function editItem(id){const i=db.items.find(x=>x.id===id),t=prompt('Item name',i.title);if(t===null)return;const p=prompt('Price (PKR)',i.price);if(p===null)return;
+ const {error}=await sb.from('menu_items').update({title:t||i.title,price:+p||i.price}).eq('id',id);
+ if(error)return err('Update failed',error);loadMenu()}
+
+function qrTab(){
+ const n=S.qrN,tabs=Array.from({length:n},(_,k)=>k+1);
+ return `<div class="card p-4 mb-4"><h3 class="font-bold mb-2">Indoor table QR codes</h3>
+ <div class="flex gap-2"><input id="qn" class="inp" type="number" min="1" max="60" value="${n}"><button class="btn in" onclick="set({qrN:Math.min(60,Math.max(1,+$('#qn').value||1))})">Generate</button></div></div>
+ <div class="grid grid-cols-2 sm:grid-cols-3 gap-3">${tabs.map(t=>`<div class="card p-3 text-center"><div class="qr mx-auto bg-white p-2 rounded inline-block" data-u="${base()}&table=${t}"></div><p class="font-bold mt-2">Table ${t}</p>
+ <p class="text-[10px] text-stone-500 break-all">${base()}&amp;table=${t}</p>
+ <div class="flex gap-1 mt-2"><button class="btn ghost text-xs flex-1" onclick="toast('Table ${t} QR download started (mock)')">Download</button><button class="btn ghost text-xs flex-1" onclick="set({view:'menu',ctype:'INDOOR',table:'${t}'})">Preview</button></div></div>`).join('')}</div>
+ <div class="card p-4 mt-4"><h3 class="font-bold">Outdoor / WhatsApp link</h3><p class="text-xs break-all mt-1 text-stone-500">${base()}&amp;type=outdoor</p>
+ <div class="flex gap-2 mt-3"><button class="btn em" onclick="copyLink()">Copy link</button><button class="btn ghost" onclick="set({view:'menu',ctype:'OUTDOOR'})">Preview</button></div></div>`}
+function drawQR(){document.querySelectorAll('.qr').forEach(el=>{el.innerHTML='';try{new QRCode(el,{text:el.dataset.u,width:110,height:110})}catch(e){el.textContent='QR'}})}
+function copyLink(){const u=base()+'&type=outdoor';try{navigator.clipboard.writeText(u).then(()=>toast('Link copied'),()=>toast(u))}catch(e){toast(u)}}
+
+/* ---------- CUSTOMER ---------- */
+const total=()=>cart.reduce((s,c)=>s+c.price*c.quantity,0),count=()=>cart.reduce((s,c)=>s+c.quantity,0);
+function menu(){
+ const VR=VP||R;
+ if(!VR)return '<p class="card p-8 text-center mt-3">Open this page from your restaurant\'s QR code or order link.</p>';
+ const out=S.ctype==='OUTDOOR',name=VR.name;
+ const items=db.items.filter(i=>(S.cat==='All'||i.category===S.cat)&&i.title.toLowerCase().includes(S.q.toLowerCase()));
+ if(S.cartOpen)return cartView();
+ return `<div class="rounded-2xl p-5 text-white" style="background:linear-gradient(135deg,#047857,#4f46e5)"><h2 class="text-2xl font-extrabold">${esc(name)}</h2>
+ <span class="bdg am inline-block mt-2">${out?'Outdoor / Takeaway / Delivery Order':'Table '+esc(S.table)}</span></div>
+ <input class="inp mt-3" placeholder="Search the menu" value="${esc(S.q)}" oninput="S.q=this.value;renderList()">
+ <div class="flex gap-2 overflow-x-auto mt-3">${['All',...db.cats].map(c=>`<button class="chip ${S.cat===c?'on':''}" onclick="set({cat:'${esc(c)}'})">${esc(c)}</button>`).join('')}</div>
+ <div id="list" class="mt-3">${listHTML(items)}</div>`}
+function renderList(){$('#list').innerHTML=listHTML(db.items.filter(i=>(S.cat==='All'||i.category===S.cat)&&i.title.toLowerCase().includes(S.q.toLowerCase())))}
+function listHTML(items){return items.length?items.map(i=>{const c=cart.find(x=>x.id===i.id);return `<div class="card p-3 mb-2 flex gap-3 items-center ${i.is_available?'':'opacity-50'}">
+ ${i.img?`<img src="${esc(i.img)}" alt="" class="w-16 h-16 rounded-lg object-cover">`:''}
+ <div class="flex-1 min-w-0"><b>${esc(i.title)}</b><p class="text-xs text-stone-500">${esc(i.description)}</p><p class="text-sm font-semibold text-emerald-600 mt-1">${pk(i.price)}</p></div>
+ ${!i.is_available?'<span class="bdg b-CANCELLED">Sold out</span>':c?`<div class="flex items-center gap-2"><button class="btn ghost px-3" onclick="qty(${i.id},-1)" aria-label="Remove one">−</button><b>${c.quantity}</b><button class="btn em px-3" onclick="qty(${i.id},1)" aria-label="Add one">+</button></div>`:`<button class="btn em" onclick="qty(${i.id},1)">Add</button>`}</div>`}).join(''):'<p class="text-center text-stone-500 py-8">Nothing matches. Try another search or category.</p>'}
+function qty(id,d){const i=db.items.find(x=>x.id===id);let c=cart.find(x=>x.id===id);
+ if(!c){if(d>0)cart.push({id,title:i.title,price:i.price,quantity:1,note:''})}else{c.quantity+=d;if(c.quantity<=0)cart=cart.filter(x=>x.id!==id)}
+ saveCart();S.cartOpen?render():(render())}
+function cartBar(){return count()&&!S.cartOpen?`<button onclick="set({cartOpen:true})" class="fixed bottom-4 left-4 right-4 max-w-2xl mx-auto btn in flex justify-between shadow-lg"><span>View cart (${count()})</span><span>${pk(total())}</span></button>`:''}
+function cartView(){const out=S.ctype==='OUTDOOR';
+ if(!cart.length)return `<button class="underline text-sm" onclick="set({cartOpen:false})">Back to menu</button><p class="card p-8 text-center mt-3">Your cart is empty. Add something from the menu.</p>`;
+ return `<button class="underline text-sm" onclick="set({cartOpen:false})">Back to menu</button><h2 class="text-2xl font-bold mt-2">Your order</h2>
+ ${cart.map(c=>`<div class="card p-3 mt-2"><div class="flex justify-between items-center"><b>${esc(c.title)}</b><div class="flex items-center gap-2"><button class="btn ghost px-3" onclick="qty(${c.id},-1)">−</button><b>${c.quantity}</b><button class="btn em px-3" onclick="qty(${c.id},1)">+</button></div></div>
+ <input class="inp mt-2 text-sm" placeholder="Special instructions" value="${esc(c.note)}" onchange="cart.find(x=>x.id===${c.id}).note=this.value;saveCart()"><p class="text-right text-sm mt-1">${pk(c.price*c.quantity)}</p></div>`).join('')}
+ <p class="text-right text-xl font-bold mt-3">Total ${pk(total())}</p>
+ <form onsubmit="place(event)" class="card p-4 mt-3 space-y-2"><h3 class="font-bold">${out?'Delivery details':'Your details'}</h3>
+ <input class="inp" name="name" placeholder="Name" required><input class="inp" name="phone" inputmode="tel" placeholder="${out?'WhatsApp number':'Phone number'}" required>
+ ${out?'<textarea class="inp" name="addr" placeholder="Delivery address" required></textarea>':''}<input class="inp" name="note" placeholder="Note for the kitchen (optional)">
+ <button class="btn em w-full">Place order · ${pk(total())}</button></form>`}
+async function place(e){e.preventDefault();
+ const f=Object.fromEntries(new FormData(e.target)),btn=e.target.querySelector('button');
+ btn.disabled=true;btn.textContent='Sending…';
+ const row={restaurant_id:(VP||R).id,order_type:S.ctype,table_number:S.ctype==='INDOOR'?String(S.table):null,customer_name:f.name,customer_phone:f.phone,delivery_address:f.addr||null,note:f.note||'',
+  items:cart.map(c=>({title:c.title,quantity:c.quantity,price:c.price,note:c.note})),total_amount:total(),status:'PENDING'};
+ const {error}=await sb.from('orders').insert(row);
+ if(error){btn.disabled=false;btn.textContent='Place order';return err('Could not send order',error)}
+ cart=[];saveCart();S.cartOpen=false;render();toast('Order sent to the kitchen')}
+render();
+(async()=>{
+ if(!sb){loading=false;render();return toast('Could not load Supabase')}
+ sb.auth.onAuthStateChange((ev,sess)=>{if(ev==='INITIAL_SESSION')return;const u=sess&&sess.user||null;setTimeout(()=>onAuth(u),0)});
+ const {data:{session}}=await sb.auth.getSession();
+ user=session?session.user:null;
+ if(user)await loadOwnerRestaurant();
+ const p=new URLSearchParams(location.search),rid=p.get('rest_id');
+ if(rid){const {data}=await sb.from('restaurants').select('id,name').eq('id',rid).maybeSingle();VP=data}
+ if(p.get('table')){S.view='menu';S.ctype='INDOOR';S.table=p.get('table')}
+ else if(p.get('type')==='outdoor'){S.view='menu';S.ctype='OUTDOOR'}
+ loading=false;render();startSync()})();
+</script>
+</body>
+</html>
